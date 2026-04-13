@@ -7,7 +7,17 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from cron.scheduler import (
+    _resolve_origin,
+    _resolve_delivery_target,
+    _deliver_result,
+    _send_media_via_adapter,
+    run_job,
+    SILENT_MARKER,
+    _build_job_prompt,
+    _summarize_activity,
+    _log_job_progress,
+)
 
 
 class TestResolveOrigin:
@@ -43,6 +53,38 @@ class TestResolveOrigin:
     def test_empty_origin(self):
         job = {"origin": {}}
         assert _resolve_origin(job) is None
+
+
+class TestCronProgressLogging:
+    def test_summarize_activity_normalizes_missing_fields(self):
+        summary = _summarize_activity({"seconds_since_activity": 1.234})
+        assert summary == {
+            "last_activity_desc": "unknown",
+            "current_tool": "none",
+            "api_call_count": 0,
+            "max_iterations": 0,
+            "seconds_since_activity": 1.2,
+        }
+
+    def test_log_job_progress_emits_useful_status_line(self, caplog):
+        activity = {
+            "last_activity_desc": "calling web_search",
+            "current_tool": "web_search",
+            "api_call_count": 3,
+            "max_iterations": 60,
+            "seconds_since_activity": 4.25,
+        }
+        with caplog.at_level(logging.INFO, logger="cron.scheduler"):
+            _log_job_progress("Daily news digest for Oleksiy", 17.8, activity)
+
+        assert any(
+            "still running" in r.message
+            and "elapsed=17.8s" in r.message
+            and "idle=4.2s" in r.message
+            and "tool=web_search" in r.message
+            and "iteration=3/60" in r.message
+            for r in caplog.records
+        ), [r.message for r in caplog.records]
 
 
 class TestResolveDeliveryTarget:

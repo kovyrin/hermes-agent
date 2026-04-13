@@ -15,6 +15,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -572,6 +573,41 @@ def _build_job_prompt(job: dict) -> str:
     return "\n".join(parts)
 
 
+def _get_progress_log_interval_seconds() -> float:
+    """How often to emit cron in-flight progress logs while a job is still running."""
+    try:
+        value = float(os.getenv("HERMES_CRON_PROGRESS_LOG_INTERVAL", "30"))
+    except (TypeError, ValueError):
+        value = 30.0
+    return max(1.0, value)
+
+
+def _summarize_activity(activity: dict) -> dict:
+    """Normalize activity tracker output into a stable cron log payload."""
+    return {
+        "last_activity_desc": activity.get("last_activity_desc", "unknown"),
+        "current_tool": activity.get("current_tool") or "none",
+        "api_call_count": activity.get("api_call_count", 0),
+        "max_iterations": activity.get("max_iterations", 0),
+        "seconds_since_activity": round(float(activity.get("seconds_since_activity", 0.0) or 0.0), 1),
+    }
+
+
+def _log_job_progress(job_name: str, elapsed_seconds: float, activity: dict) -> None:
+    """Emit a concise in-flight heartbeat for a running cron job."""
+    summary = _summarize_activity(activity)
+    logger.info(
+        "Job '%s' still running | elapsed=%.1fs | idle=%.1fs | activity=%s | tool=%s | iteration=%s/%s",
+        job_name,
+        elapsed_seconds,
+        summary["seconds_since_activity"],
+        summary["last_activity_desc"],
+        summary["current_tool"],
+        summary["api_call_count"],
+        summary["max_iterations"],
+    )
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -598,6 +634,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
+
+    _job_started_monotonic = time.monotonic()
+    _progress_log_interval = _get_progress_log_interval_seconds()
+    _last_progress_log_monotonic = _job_started_monotonic
+    _last_progress_signature = None
 
     try:
         # Inject origin context so the agent's send_message tool knows the chat.
@@ -764,7 +805,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # _touch_activity() on every tool call, API call, and stream delta).
         _cron_timeout = float(os.getenv("HERMES_CRON_TIMEOUT", 600))
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
-        _POLL_INTERVAL = 5.0
+        _POLL_INTERVAL = max(0.5, min(5.0, _progress_log_interval))
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         _cron_future = _cron_pool.submit(agent.run_conversation, prompt)
         _inactivity_timeout = False
@@ -783,12 +824,23 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                         break
                     # Agent still running — check inactivity.
                     _idle_secs = 0.0
+                    _act = {}
                     if hasattr(agent, "get_activity_summary"):
                         try:
                             _act = agent.get_activity_summary()
                             _idle_secs = _act.get("seconds_since_activity", 0.0)
                         except Exception:
-                            pass
+                            _act = {}
+                    if _act:
+                        _now_monotonic = time.monotonic()
+                        _progress_signature = tuple(sorted(_summarize_activity(_act).items()))
+                        if (
+                            _progress_signature != _last_progress_signature
+                            or (_now_monotonic - _last_progress_log_monotonic) >= _progress_log_interval
+                        ):
+                            _log_job_progress(job_name, _now_monotonic - _job_started_monotonic, _act)
+                            _last_progress_log_monotonic = _now_monotonic
+                            _last_progress_signature = _progress_signature
                     if _idle_secs >= _cron_inactivity_limit:
                         _inactivity_timeout = True
                         break
@@ -831,6 +883,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
+        _elapsed_seconds = time.monotonic() - _job_started_monotonic
+        logger.info(
+            "Job '%s' completed | elapsed=%.1fs | response_chars=%d",
+            job_name,
+            _elapsed_seconds,
+            len(final_response),
+        )
         
         output = f"""# Cron Job: {job_name}
 
